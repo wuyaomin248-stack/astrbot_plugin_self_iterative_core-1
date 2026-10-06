@@ -12,9 +12,12 @@ from astrbot.core.star.star_manager import PluginManager
 
 from .file_manager import FileManager
 from .log_manager import LogManager
+from .safety_ast import validate_python_code
+from .skill_memory import SkillMemory
 
 file_manager: Optional[FileManager] = None
 log_manager: Optional[LogManager] = None
+skill_memory: Optional[SkillMemory] = None
 TOOL_CONFIG: dict = {}
 
 
@@ -23,8 +26,10 @@ def init_managers(config: dict):
     global file_manager, log_manager, TOOL_CONFIG
     TOOL_CONFIG = config if config else {}
 
+    global skill_memory
     base_path = config.get("plugin_base_dir", "./data/plugins")
     file_manager = FileManager(base_path=base_path)
+    skill_memory = SkillMemory(db_path=os.path.join(base_path, "../skill_memory.db"))
     if log_manager is not None:
         try:
             log_manager.shutdown()
@@ -125,7 +130,33 @@ class WriteFileTool(FunctionTool[AstrAgentContext]):
 
         await _send_tip(context, f"📝 正在编写文件: {plugin_name}/{file_path} ...")
 
+        # 对 Python 代码执行 AST 语法与系统级安全调用校验
+        if file_path.endswith(".py"):
+            is_valid, msg, warnings = validate_python_code(content)
+            if not is_valid:
+                warn_details = "\n".join(f"- {w}" for w in warnings) if warnings else ""
+                err_msg = f"❌ [安全预检拦截] 拒绝写入文件 {file_path}：{msg}\n{warn_details}"
+                if skill_memory:
+                    skill_memory.record_experience(
+                        plugin_name=plugin_name,
+                        task_type="write_file_safety_rejection",
+                        target_file=file_path,
+                        error_signature=msg,
+                        resolution_summary="AST 静态安全或编译检查拦截，已阻止写入磁盘",
+                        is_success=False
+                    )
+                return err_msg
+
         result = await file_manager.write_file(plugin_name, file_path, content)
+        if skill_memory:
+            skill_memory.record_experience(
+                plugin_name=plugin_name,
+                task_type="write_file_success",
+                target_file=file_path,
+                error_signature="",
+                resolution_summary=f"成功写入文件 {file_path}",
+                is_success=True
+            )
 
         return (
             f"{result}\n"

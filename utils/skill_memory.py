@@ -6,7 +6,7 @@ from typing import List, Dict, Optional
 
 class SkillMemory:
     """
-    轻量 SQLite 经验反思库 (SkillMemory)
+    轻量 SQLite 经验反思库 (SkillMemory v2)
     记录每次排障、迭代的成败特征与自愈方案，防止重复踩坑
     由 日海 & 橙子汐 架构贡献设计
     """
@@ -32,7 +32,7 @@ class SkillMemory:
             """)
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_plugin_err 
-                ON skill_records(plugin_name, is_success);
+                ON skill_records(plugin_name, task_type, is_success);
             """)
             conn.commit()
 
@@ -47,16 +47,36 @@ class SkillMemory:
             """, (plugin_name, task_type, target_file, error_signature, resolution_summary, 1 if is_success else 0, time.time()))
             conn.commit()
 
-    def query_experience(self, plugin_name: str, limit: int = 5) -> List[Dict]:
+    def query_experience(self, plugin_name: str, task_type: Optional[str] = None, 
+                         error_signature: Optional[str] = None, is_success: Optional[bool] = None,
+                         limit: int = 5) -> List[Dict]:
+        safe_limit = max(1, min(limit if isinstance(limit, int) else 5, 50))
+        conditions = ["plugin_name = ?"]
+        params = [plugin_name]
+
+        if task_type:
+            conditions.append("task_type = ?")
+            params.append(task_type)
+        if error_signature:
+            conditions.append("error_signature LIKE ?")
+            params.append(f"%{error_signature}%")
+        if is_success is not None:
+            conditions.append("is_success = ?")
+            params.append(1 if is_success else 0)
+
+        where_clause = " AND ".join(conditions)
+        sql = f"""
+            SELECT id, task_type, target_file, error_signature, resolution_summary, is_success, created_at
+            FROM skill_records
+            WHERE {where_clause}
+            ORDER BY created_at DESC
+            LIMIT ?
+        """
+        params.append(safe_limit)
+
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT id, task_type, target_file, error_signature, resolution_summary, is_success, created_at
-                FROM skill_records
-                WHERE plugin_name = ?
-                ORDER BY created_at DESC
-                LIMIT ?
-            """, (plugin_name, limit))
+            cursor.execute(sql, tuple(params))
             rows = cursor.fetchall()
             return [
                 {
