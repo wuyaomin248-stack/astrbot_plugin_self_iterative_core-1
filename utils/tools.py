@@ -147,21 +147,47 @@ class WriteFileTool(FunctionTool[AstrAgentContext]):
                     )
                 return err_msg
 
-        result = await file_manager.write_file(plugin_name, file_path, content)
+        # 经验库前置闭环：查询历史避坑经验
+        warning_exp = ""
+        if skill_memory:
+            past_failures = skill_memory.query_experience(
+                plugin_name=plugin_name,
+                is_success=False,
+                limit=3
+            )
+            if past_failures:
+                tips = [f"• [{f['task_type']}] {f['error_signature']}" for f in past_failures if f.get('error_signature')]
+                if tips:
+                    warning_exp = "\n💡 [经验库前置提示] 该插件存在以下已知避坑记录：\n" + "\n".join(tips)
+
+        success, result = await file_manager.write_file(plugin_name, file_path, content)
+        if not success:
+            if skill_memory:
+                skill_memory.record_experience(
+                    plugin_name=plugin_name,
+                    task_type="write_file_failure",
+                    target_file=file_path,
+                    error_signature=result,
+                    resolution_summary=f"原子写入文件失败: {result}",
+                    is_success=False
+                )
+            return f"❌ {result}"
+
         if skill_memory:
             skill_memory.record_experience(
                 plugin_name=plugin_name,
                 task_type="write_file_success",
                 target_file=file_path,
                 error_signature="",
-                resolution_summary=f"成功写入文件 {file_path}",
+                resolution_summary=f"成功原子写入文件 {file_path}",
                 is_success=True
             )
 
         return (
             f"{result}\n"
-            f"[System Hint] File updated. AstrBot is detecting changes.\n"
-            f"--> Please call 'dev_check_logs' NOW to verify the reload status based on the 'LOG INTERPRETATION RULES' in the tool description."
+            f"{warning_exp}\n"
+            f"[System Hint] File updated atomically with snapshot backup. AstrBot is detecting changes.\n"
+            f"--> Please call 'dev_check_logs' NOW to verify the reload status. If it fails, call 'dev_rollback_file' to revert."
         )
 
 
@@ -442,3 +468,51 @@ class UninstallPluginTool(FunctionTool[AstrAgentContext]):
             return f"Plugin '{plugin_name}' uninstalled successfully."
         except Exception as e:
             return f"Failed to uninstall plugin '{plugin_name}': {str(e)}"
+@dataclass
+class RollbackFileTool(FunctionTool[AstrAgentContext]):
+    name: str = "dev_rollback_file"
+    description: str = (
+        "Revert a file to its previous atomic backup snapshot (.atomic_bak). "
+        "Use this if modifying a file caused critical syntax errors or plugin crash and you need instant self-healing."
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "plugin_name": {
+                    "type": "string",
+                    "description": "The name of the plugin directory.",
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "Relative file path to revert (e.g., 'main.py').",
+                },
+            },
+            "required": ["plugin_name", "file_path"],
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        if not _check_permission(context):
+            return PERMISSION_DENIED_MSG
+        if not file_manager:
+            return "Error: FileManager not initialized."
+
+        plugin_name = kwargs.get("plugin_name")
+        file_path = kwargs.get("file_path")
+
+        if not all([plugin_name, file_path]):
+            return "Error: Missing required parameters (plugin_name or file_path)."
+
+        await _send_tip(context, f"⏪ 正在回滚文件: {plugin_name}/{file_path} ...")
+        success, msg = await file_manager.rollback_file(plugin_name, file_path)
+        if skill_memory:
+            skill_memory.record_experience(
+                plugin_name=plugin_name,
+                task_type="file_rollback",
+                target_file=file_path,
+                error_signature="" if success else msg,
+                resolution_summary=msg,
+                is_success=success
+            )
+        return msg
